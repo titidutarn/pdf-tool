@@ -11,6 +11,7 @@
 # dark as the text it replaces (`was`, the box's text before).
 # Exit 2: the PDF is protected; exit 3: a character no font here can draw.
 import json
+import re
 import sys
 
 import pymupdf
@@ -83,11 +84,14 @@ def ink(page, rect):
 
 
 def write(page, font, x, y, text, size, color, bold=0.0):
-    """`text` at (x, y); `bold`: drawn again that much (a share of its size) to the right, a heavier stroke."""
-    for dx in (0, bold * size) if bold else (0,):
-        tw = pymupdf.TextWriter(page.rect, color=color)
-        tw.append((x + dx, y), text, font=font, fontsize=size)
-        tw.write_text(page)
+    """`text` at (x, y); `bold`: its outline drawn too, that thick (a share of its size), a heavier stroke at any zoom."""
+    tw = pymupdf.TextWriter(page.rect, color=color)
+    tw.append((x, y), text, font=font, fontsize=size)
+    tw.write_text(page, render_mode=2 if bold else 0)
+    if bold:
+        # TextWriter sets its own outline width: this one instead.
+        xref = page.get_contents()[-1]
+        page.parent.update_stream(xref, re.sub(rb"\n2 Tr\n[\d.]+ w", b"\n2 Tr\n%.3f w" % (bold * size), page.parent.xref_stream(xref), count=1))
 
 
 def heavier(page, e, font, color):
@@ -100,10 +104,10 @@ def heavier(page, e, font, color):
     if not target or target > 0.6:
         return 0.0
     best, gap = 0.0, None
-    for bold in (0.0, 0.01, 0.02, 0.03, 0.04, 0.05):
+    for bold in (0.0, 0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04):
         sheet = pymupdf.open().new_page(width=r.x1 + 20, height=r.y1 + 20)
         write(sheet, font, r.x0, e["origin"][1], was, e["size"], color, bold)
-        width = font.text_length(was, fontsize=e["size"]) + bold * e["size"]
+        width = font.text_length(was, fontsize=e["size"])
         d = abs(ink(sheet, pymupdf.Rect(r.x0, r.y0, r.x0 + width, r.y1)) - target)
         if gap is None or d < gap:
             best, gap = bold, d
