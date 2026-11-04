@@ -2,19 +2,69 @@
 # pdf-tool: read a PDF's text runs, and rewrite some of them in place. AGPL-3.0 (built on PyMuPDF), see LICENSE.
 #
 #   pdf_tool.py extract in.pdf                  -> JSON on stdout: every horizontal run of text
-#                                                  {page, line, bbox, origin, text, font, size, color, hidden}
+#                                                  {page, line, bbox, origin, text, font, size, color, hidden, ocr?}
 #   pdf_tool.py apply in.pdf edits.json out.pdf -> each edit's box erased (its text only) and its new text written
 #
-# An edit: {"page", "bbox", "origin", "text", "font", "size", "color", "was"?, "align"?: "right", "mark"?: true}.
+# `in.pdf` may be an image too, a photo or a scan: it becomes a page of its size, and `out.pdf` a PDF. A page with no
+# text of its own is read by OCR (Tesseract, in PyMuPDF's wheel; its language data in tessdata/, setup.sh): its runs
+# come with `ocr`, `font` being "helv" or "hebo" by the weight of their strokes.
+#
+# An edit: {"page", "bbox", "origin", "text", "font", "size", "color", "was"?, "align"?: "right", "mark"?: true, "ocr"?: true}.
 # An empty bbox erases nothing; an empty text writes nothing. The new text keeps the PDF's own font when it
 # has every glyph, else the closest standard one (Helvetica, Times, Courier), bold and italic kept, made as
-# dark as the text it replaces (`was`, the box's text before).
+# dark as the text it replaces (`was`, the box's text before). A page with `ocr` edits is drawn again as a picture:
+# each box's pixels replaced by the paper around them (nothing of what was there is left in the file), its new text
+# in `font`, in the shade of the text it replaces.
 # Exit 2: the PDF is protected; exit 3: a character no font here can draw.
+import io
 import json
+import os
 import re
 import sys
 
+import numpy as np
+import pillow_heif
 import pymupdf
+from PIL import Image, ImageOps, ImageSequence
+
+pillow_heif.register_heif_opener()
+
+TESSDATA = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tessdata")
+LANGUAGES = "fra+eng+spa"
+# Below this many characters of its own, a page that is mostly a picture is a scan (a scanner's footer on it).
+SCAN_CHARS = 40
+# How wide a page is read and drawn again, in pixels: A4 at 300 dpi.
+PAGE_PIXELS = 2480
+# A stroke this much thicker than the page's usual one is bold (measured on scans and photos: regular up to 1.35, bold from 1.8).
+BOLD_STROKE = 1.5
+# This share of a page dark: maybe light text on a fill (a table's head), read in a second pass.
+DARK_SHARE = 0.03
+# What the OCR reads on a photo with no text is gibberish: this share of its characters at least must be in real words or numbers (measured: gibberish 0.45, documents 0.75).
+WORDY_SHARE = 0.6
+# Pages of a scan read at most: each takes a second or two, and pdf-tool has a minute (pdf-tool.ts).
+OCR_PAGES = 15
+
+
+def load(path):
+    """The file as a PDF: an image becomes a page of its size (one per frame of a TIFF), upright (a phone's says how in its EXIF)."""
+    with open(path, "rb") as f:
+        data = f.read()
+    try:
+        doc = pymupdf.open(stream=data)
+        if doc.is_pdf:
+            return doc
+    except pymupdf.FileDataError:
+        pass
+    pages = pymupdf.open()
+    with Image.open(io.BytesIO(data)) as image:
+        dpi = image.info.get("dpi", (0, 0))[0] or 150
+        for frame in ImageSequence.Iterator(image):
+            upright = ImageOps.exif_transpose(frame).convert("RGB")
+            jpeg = io.BytesIO()
+            upright.save(jpeg, "JPEG", quality=92)
+            page = pages.new_page(width=upright.width * 72 / dpi, height=upright.height * 72 / dpi)
+            page.insert_image(page.rect, stream=jpeg.getvalue())
+    return pymupdf.open("pdf", pages.tobytes())
 
 
 def runs(page, line_no):
@@ -40,13 +90,121 @@ def runs(page, line_no):
     return out, line_no
 
 
+def scanned(page, found):
+    """Nothing to read on the page but its picture: no text of its own, or a few words on a page that is mostly a picture."""
+    chars = sum(len(r["text"].strip()) for r in found if not r["hidden"])
+    if not chars:
+        return True
+    area = sum(abs(pymupdf.Rect(i["bbox"]) & page.rect) for i in page.get_image_info())
+    return chars < SCAN_CHARS and area > abs(page.rect) / 2
+
+
+def gray_of(page, zoom):
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), colorspace=pymupdf.csGRAY)
+    return np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.stride)[:, :pix.width]
+
+
+def evened(a):
+    """A photo's light evened out: each pixel over the paper around it (the bright end of a coarse grid, smoothed)."""
+    h, w = a.shape
+    k = max(w // 12, 64)
+    rows, cols = h // k + 2, w // k + 2
+    grid = np.empty((rows, cols), np.float32)
+    for i in range(rows):
+        for j in range(cols):
+            cell = a[max(0, (i - 1) * k + k // 2):(i + 1) * k + k // 2, max(0, (j - 1) * k + k // 2):(j + 1) * k + k // 2]
+            grid[i, j] = np.percentile(cell, 90) if cell.size else 255
+    ys, xs = np.linspace(0, rows - 1, h), np.linspace(0, cols - 1, w)
+    y0, x0 = ys.astype(int), xs.astype(int)
+    y1, x1 = np.minimum(y0 + 1, rows - 1), np.minimum(x0 + 1, cols - 1)
+    fy, fx = (ys - y0)[:, None], (xs - x0)[None, :]
+    paper = (grid[y0][:, x0] * (1 - fx) + grid[y0][:, x1] * fx) * (1 - fy) + (grid[y1][:, x0] * (1 - fx) + grid[y1][:, x1] * fx) * fy
+    return np.clip(a / np.maximum(paper, 1) * 255, 0, 255).astype(np.uint8)
+
+
+def ocr_lines(a, rect, dpi):
+    """What Tesseract reads on a picture `a`: [(text, box in the page's points)]."""
+    pix = pymupdf.Pixmap(pymupdf.csGRAY, a.shape[1], a.shape[0], a.tobytes(), False)
+    page = pymupdf.open().new_page(width=rect.width, height=rect.height)
+    page.insert_image(page.rect, pixmap=pix)
+    textpage = page.get_textpage_ocr(language=LANGUAGES, dpi=dpi, full=True, tessdata=TESSDATA)
+    out = []
+    for b in page.get_text("dict", textpage=textpage, flags=pymupdf.TEXTFLAGS_TEXT)["blocks"]:
+        for line in b.get("lines", []):
+            text = "".join(s["text"] for s in line["spans"]).strip(" |")
+            if re.search(r"\w", text):
+                out.append((text, pymupdf.Rect(line["bbox"])))
+    return out
+
+
+def measure(a, box, zoom):
+    """A line in the picture: its box close around its ink (the OCR's is loose on a photo), its foot, its strokes in pixels."""
+    x0, y0, x1, y1 = (round(v * zoom) for v in box)
+    crop = a[max(0, y0):y1, max(0, x0):x1]
+    if not crop.size:
+        return box, box.y1, 0
+    paper = float(np.median(crop))
+    far = float(crop.min() if paper >= 128 else crop.max())
+    if abs(paper - far) < 24:
+        return box, box.y1, 0
+    ink = crop < (paper + far) / 2 if paper >= 128 else crop > (paper + far) / 2
+    rows = ink.sum(1)
+    peak = int(rows.argmax())
+    top, bottom = peak, peak
+    while top > 0 and rows[top - 1]:
+        top -= 1
+    while bottom < len(rows) - 1 and rows[bottom + 1]:
+        bottom += 1
+    well_inked = np.nonzero(rows[top:bottom + 1] >= rows[peak] * 0.3)[0]
+    foot = top + int(well_inked[-1]) + 1
+    edges = np.diff(np.pad(ink[top:bottom + 1].astype(np.int8), ((0, 0), (1, 1))), axis=1)
+    runs_of_ink = np.nonzero(edges == -1)[1] - np.nonzero(edges == 1)[1]
+    origin = max(0, y0)
+    return pymupdf.Rect(box.x0, (origin + top) / zoom, box.x1, (origin + bottom + 1) / zoom), (origin + foot) / zoom, float(np.median(runs_of_ink)) if runs_of_ink.size else 0
+
+
+def read_picture(page, line_no):
+    """A page read by OCR, a run per line: dark text on its paper, then light text on a fill; each sized to fill its box in Helvetica, bold when its strokes are thick."""
+    zoom = PAGE_PIXELS / page.rect.width
+    a = evened(gray_of(page, zoom))
+    dpi = round(zoom * 72)
+    lines = ocr_lines(a, page.rect, dpi)
+    if (a < 170).mean() > DARK_SHARE:
+        fill = lambda b: np.median(a[round(b.y0 * zoom):round(b.y1 * zoom), round(b.x0 * zoom):round(b.x1 * zoom)]) < 170
+        lines += [(t, b) for t, b in ocr_lines(255 - a, page.rect, dpi) if fill(b) and not any(abs(b & o) > abs(b) * 0.3 for _, o in lines)]
+    # A box a tenth of the page high is the OCR reading a shadow.
+    lines = [(t, b) for t, b in lines if b.height < page.rect.height / 10]
+    wordy = sum(len(w) for t, _ in lines for w in re.findall(r"[^\W\d_]{4,}|\d[\d .,]*\d", t))
+    if wordy < sum(len(t) for t, _ in lines) * WORDY_SHARE:
+        return [], line_no
+    helv, hebo = pymupdf.Font("helv"), pymupdf.Font("hebo")
+    found = []
+    for text, box in lines:
+        tight, foot, stroke = measure(a, box, zoom)
+        size = box.width / helv.text_length(text, fontsize=1)
+        found.append((text, box if tight.is_empty else tight, foot, stroke / zoom / max(size, 1)))
+    usual = float(np.median([f[3] for f in found])) if found else 0
+    out = []
+    for text, box, foot, stroke in sorted(found, key=lambda f: (f[1].y1, f[1].x0)):
+        line_no += 1
+        font = hebo if usual and len(text) > 3 and stroke >= usual * BOLD_STROKE else helv
+        size = box.width / font.text_length(text, fontsize=1) if len(text) > 3 else box.height / 0.72
+        out.append({"page": page.number, "line": line_no, "text": text, "bbox": list(box), "origin": [box.x0, foot], "font": "hebo" if font is hebo else "helv", "size": round(size, 2), "color": 0, "hidden": False, "ocr": True})
+    return out, line_no
+
+
 def extract(path):
-    doc = pymupdf.open(path)
+    doc = load(path)
     if doc.needs_pass:
         sys.exit(2)
     out, line_no = [], 0
+    read = 0
     for page in doc:
         found, line_no = runs(page, line_no)
+        # shortcut: a scan's pages after the 15th have no text to click; upgrade when a client has such a file.
+        if read < OCR_PAGES and scanned(page, found) and all(os.path.isfile(os.path.join(TESSDATA, f"{l}.traineddata")) for l in LANGUAGES.split("+")):
+            read += 1
+            found, line_no = read_picture(page, line_no)
         out += found
     return out
 
@@ -114,29 +272,74 @@ def heavier(page, e, font, color):
     return best
 
 
+def redraw(doc, n, todo):
+    """A page's picture drawn again without what `todo` covers: each box takes the paper just above and below it. Back: the page, its text shades on the edits."""
+    page = doc[n]
+    # Its own resolution when it has a single picture, at most an A4's at 300 dpi.
+    pictures = page.get_image_info()
+    zoom = min(PAGE_PIXELS / page.rect.width, max((i["width"] / abs(pymupdf.Rect(i["bbox"]).width) for i in pictures), default=PAGE_PIXELS / page.rect.width))
+    pix = page.get_pixmap(matrix=pymupdf.Matrix(zoom, zoom), colorspace=pymupdf.csRGB)
+    a = np.frombuffer(pix.samples, np.uint8).reshape(pix.height, pix.stride // 3, 3)[:, :pix.width].astype(np.float32)
+    for e in todo:
+        r = pymupdf.Rect(e["bbox"])
+        if r.is_empty:
+            continue
+        x0, y0 = max(0, round(r.x0 * zoom) - 2), max(1, round(r.y0 * zoom) - 3)
+        x1, y1 = min(pix.width, round(r.x1 * zoom) + 2), min(pix.height - 1, round(r.y1 * zoom) + 3)
+        crop = a[y0:y1, x0:x1].reshape(-1, 3)
+        gray = crop.mean(1)
+        # Its paper, the box's commonest shade; its text, the furthest from it.
+        paper = np.median(crop, 0)
+        far = np.abs(gray - paper.mean())
+        ink = crop[far >= np.percentile(far, 95)].mean(0)
+        e["color"] = sum(int(round(c)) << s for c, s in zip(ink, (16, 8, 0)))
+        # Each column from the rows just outside the box, smoothed along the line so a stray tail leaves no streak.
+        size = 9
+        pad = lambda row: np.stack([np.convolve(np.pad(row[:, c], size // 2, mode="edge"), np.ones(size) / size, "valid") for c in range(3)], 1)
+        top, bottom = pad(np.median(a[max(0, y0 - 2):y0, x0:x1], 0)), pad(np.median(a[y1:y1 + 2, x0:x1], 0))
+        fade = np.linspace(0, 1, y1 - y0)[:, None, None]
+        a[y0:y1, x0:x1] = top[None] * (1 - fade) + bottom[None] * fade
+    out = pymupdf.Pixmap(pymupdf.csRGB, pix.width, pix.height, np.clip(a, 0, 255).astype(np.uint8).tobytes(), False)
+    picture = out.tobytes("jpeg", jpg_quality=88)
+    rect = page.rect
+    doc.delete_page(n)
+    page = doc.new_page(pno=n, width=rect.width, height=rect.height)
+    page.insert_image(page.rect, stream=picture)
+    return page
+
+
 def apply(src, edits, dst):
-    doc = pymupdf.open(src)
+    doc = load(src)
     if doc.needs_pass:
         sys.exit(2)
     by_page = {}
     for e in edits:
         by_page.setdefault(e["page"], []).append(e)
     for n, todo in by_page.items():
-        page = doc[n]
-        own = [own_font(doc, page, e["font"], e["text"]) for e in todo]
-        fonts = [o or fallback(e["font"]) for o, e in zip(own, todo)]
-        if any(not draws(f, e["text"]) for f, e in zip(fonts, todo)):
-            sys.exit(3)
-        colors = [tuple(((e["color"] >> s) & 255) / 255 for s in (16, 8, 0)) for e in todo]
-        # Measured before the boxes are erased: a stand-in font as dark as the text it replaces.
-        bolds = [0.0 if o else heavier(page, e, f, c) for o, e, f, c in zip(own, todo, fonts, colors)]
-        # Erase only the text in each box, its middle (the lines above and below stay): images and drawings stay.
-        erase = [pymupdf.Rect(e["bbox"]) for e in todo]
-        for r in erase:
-            if not r.is_empty:
-                page.add_redact_annot(pymupdf.Rect(r.x0 + 0.5, r.y0 + r.height * 0.2, r.x1 - 0.5, r.y1 - r.height * 0.2))
-        if any(not r.is_empty for r in erase):
-            page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE, text=pymupdf.PDF_REDACT_TEXT_REMOVE)
+        if any(e.get("ocr") for e in todo):
+            page = redraw(doc, n, todo)
+            own = [None] * len(todo)
+            fonts = [pymupdf.Font(e["font"]) for e in todo]
+            bolds = [0.0] * len(todo)
+            colors = [tuple(((e["color"] >> s) & 255) / 255 for s in (16, 8, 0)) for e in todo]
+            if any(not draws(f, e["text"]) for f, e in zip(fonts, todo)):
+                sys.exit(3)
+        else:
+            page = doc[n]
+            own = [own_font(doc, page, e["font"], e["text"]) for e in todo]
+            fonts = [o or fallback(e["font"]) for o, e in zip(own, todo)]
+            if any(not draws(f, e["text"]) for f, e in zip(fonts, todo)):
+                sys.exit(3)
+            colors = [tuple(((e["color"] >> s) & 255) / 255 for s in (16, 8, 0)) for e in todo]
+            # Measured before the boxes are erased: a stand-in font as dark as the text it replaces.
+            bolds = [0.0 if o else heavier(page, e, f, c) for o, e, f, c in zip(own, todo, fonts, colors)]
+            # Erase only the text in each box, its middle (the lines above and below stay): images and drawings stay.
+            erase = [pymupdf.Rect(e["bbox"]) for e in todo]
+            for r in erase:
+                if not r.is_empty:
+                    page.add_redact_annot(pymupdf.Rect(r.x0 + 0.5, r.y0 + r.height * 0.2, r.x1 - 0.5, r.y1 - r.height * 0.2))
+            if any(not r.is_empty for r in erase):
+                page.apply_redactions(images=pymupdf.PDF_REDACT_IMAGE_NONE, graphics=pymupdf.PDF_REDACT_LINE_ART_NONE, text=pymupdf.PDF_REDACT_TEXT_REMOVE)
         for font, color, bold, e in zip(fonts, colors, bolds, todo):
             if not e["text"].strip():
                 continue
