@@ -8,13 +8,21 @@ written again, everything else (images, drawings, other text) stays as it was. B
 pip install -r requirements.txt
 python3 pdf_tool.py extract in.pdf                  # JSON: every horizontal run of text
 python3 pdf_tool.py apply in.pdf edits.json out.pdf # each edit's box erased, its new text written
+python3 pdf_tool.py stamp in.pdf marks.json out.pdf # a signature or a line of text placed on its pages
 ```
 
 An edit: `{"page", "bbox", "origin", "text", "font", "size", "color", "align"?: "right", "mark"?: true}`,
 as `extract` gives them with a new `text`. The new text keeps the PDF's own font when it has every
 glyph, else the closest standard one (Helvetica, Times, Courier), bold and italic kept, drawn as dark as
 the text it replaces (`"was"`: that text, in the edit).
-Exit 2: the PDF is protected; exit 3: a character no font here can draw.
+Exit 2: the PDF is protected; exit 3: a character no font here can draw; exit 4 (`stamp`): no such page.
+
+## Stamp
+
+A mark: `{"page", "kind": "image" | "text", "x", "y", "w", "h", "image"?, "text"?, "size"?}`, in points from the top
+left of the page as it shows (turned, cropped): a PNG in base64, or a line of text in Helvetica, its baseline 0.8 of
+its size under `y`. Marks are written into the page; form fields and annotations are drawn in first, so nothing covers
+a mark nor stays to change (links stay). An owner's protection stays on the copy.
 
 ## Scans and photos
 

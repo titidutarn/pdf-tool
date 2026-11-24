@@ -4,6 +4,7 @@
 #   pdf_tool.py extract in.pdf                  -> JSON on stdout: every horizontal run of text
 #                                                  {page, line, bbox, origin, text, font, size, color, hidden, ocr?}
 #   pdf_tool.py apply in.pdf edits.json out.pdf -> each edit's box erased (its text only) and its new text written
+#   pdf_tool.py stamp in.pdf marks.json out.pdf -> a signature or a line of text placed on its pages, written into them
 #
 # `in.pdf` may be an image too, a photo or a scan: it becomes a page of its size, and `out.pdf` a PDF. A page with no
 # text of its own is read by OCR (Tesseract, in PyMuPDF's wheel; its language data in tessdata/, setup.sh): its runs
@@ -15,7 +16,12 @@
 # dark as the text it replaces (`was`, the box's text before). A page with `ocr` edits is drawn again as a picture:
 # each box's pixels replaced by the paper around them (nothing of what was there is left in the file), its new text
 # in `font`, in the shade of the text it replaces.
-# Exit 2: the PDF is protected; exit 3: a character no font here can draw.
+#
+# A mark: {"page", "kind": "image" | "text", "x", "y", "w", "h", "image"? (a PNG, base64), "text"?, "size"?}, in points from
+# the top left of the page as it shows (turned, cropped); a text in Helvetica, its baseline 0.8 of its size under "y". Form
+# fields and annotations are drawn into the pages first: nothing covers the marks, nothing stays to change (links do).
+# Exit 2: the PDF is protected (it opens only with a password); exit 3: a character no font here can draw; exit 4: no such page.
+import base64
 import io
 import json
 import os
@@ -354,6 +360,40 @@ def apply(src, edits, dst):
     doc.save(dst, garbage=3, deflate=True)
 
 
+def stamp(src, marks, dst):
+    doc = load(src)
+    if doc.needs_pass:
+        sys.exit(2)
+    if any(not 0 <= m["page"] < doc.page_count for m in marks):
+        sys.exit(4)
+    helv = pymupdf.Font("helv")
+    if any(m["kind"] == "text" and not draws(helv, m["text"]) for m in marks):
+        sys.exit(3)
+    doc.bake()
+    doc.xref_set_key(doc.pdf_catalog(), "AcroForm", "null")
+    for n in sorted({m["page"] for m in marks}):
+        page = doc[n]
+        # The marks on a sheet of their own, as the page shows, then that sheet laid on the page as the page is turned.
+        sheet = pymupdf.open()
+        layer = sheet.new_page(width=page.rect.width, height=page.rect.height)
+        for m in marks:
+            if m["page"] != n:
+                continue
+            if m["kind"] == "image":
+                layer.insert_image(pymupdf.Rect(m["x"], m["y"], m["x"] + m["w"], m["y"] + m["h"]), stream=base64.b64decode(m["image"]), keep_proportion=False)
+            else:
+                write(layer, helv, m["x"], m["y"] + m["size"] * 0.8, m["text"], m["size"], (0, 0, 0))
+        sheet.subset_fonts()
+        if not page.is_wrapped:
+            page.wrap_contents()
+        turn = page.rotation
+        page.set_rotation(0)
+        page.show_pdf_page(page.rect, sheet, 0, rotate=turn)
+        page.set_rotation(turn)
+    # An owner's protection stays on the copy.
+    doc.save(dst, garbage=3, deflate=True, encryption=pymupdf.PDF_ENCRYPT_KEEP)
+
+
 if __name__ == "__main__":
     cmd, *args = sys.argv[1:] or ["help"]
     if cmd == "extract" and len(args) == 1:
@@ -361,5 +401,8 @@ if __name__ == "__main__":
     elif cmd == "apply" and len(args) == 3:
         with open(args[1]) as f:
             apply(args[0], json.load(f), args[2])
+    elif cmd == "stamp" and len(args) == 3:
+        with open(args[1]) as f:
+            stamp(args[0], json.load(f), args[2])
     else:
-        sys.exit("usage: pdf_tool.py extract in.pdf | apply in.pdf edits.json out.pdf")
+        sys.exit("usage: pdf_tool.py extract in.pdf | apply in.pdf edits.json out.pdf | stamp in.pdf marks.json out.pdf")
