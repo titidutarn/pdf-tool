@@ -4,7 +4,7 @@
 #   pdf_tool.py extract in.pdf                  -> JSON on stdout: every horizontal run of text
 #                                                  {page, line, bbox, origin, text, font, size, color, hidden, ocr?}
 #   pdf_tool.py apply in.pdf edits.json out.pdf -> each edit's box erased (its text only) and its new text written
-#   pdf_tool.py stamp in.pdf marks.json out.pdf -> a signature or a line of text placed on its pages, written into them
+#   pdf_tool.py stamp in.pdf marks.json out.pdf -> a signature, a line of text, a drawing placed on its pages, its fields filled, all written into them
 #
 # `in.pdf` may be an image too, a photo or a scan: it becomes a page of its size, and `out.pdf` a PDF. A page with no
 # text of its own is read by OCR (Tesseract, in PyMuPDF's wheel; its language data in tessdata/, setup.sh): its runs
@@ -17,10 +17,14 @@
 # each box's pixels replaced by the paper around them (nothing of what was there is left in the file), its new text
 # in `font`, in the shade of the text it replaces.
 #
-# A mark: {"page", "kind": "image" | "text", "x", "y", "w", "h", "image"? (a PNG, base64), "text"?, "size"?}, in points from
-# the top left of the page as it shows (turned, cropped); a text in Helvetica, its baseline 0.8 of its size under "y". Form
-# fields and annotations are drawn into the pages first: nothing covers the marks, nothing stays to change (links do).
-# Exit 2: the PDF is protected (it opens only with a password); exit 3: a character no font here can draw; exit 4: no such page.
+# A mark: {"page", "kind": "image" | "text" | "path" | "field", "x", "y", "w", "h", "image"? (a PNG, base64), "text"?, "size"?,
+# "path"?, "ref"?, "value"?}, in points from the top left of the page as it shows (turned, cropped); a text in Helvetica, its
+# baseline 0.8 of its size under "y"; a path's strokes, black lines "size" thick, their points from 0 to 1 across and down its
+# box. A field: "ref" the object number of one of its widgets, "value" its text (its option's words), or "On" or
+# "Off" for that checkbox or radio button; every widget of the field follows, a list shows the option chosen alone.
+# Form fields and annotations are drawn into the pages first: nothing covers the marks, nothing stays to change (links do).
+# Exit 2: the PDF is protected (it opens only with a password); exit 3: a character no font here can draw; exit 4: no such page;
+# exit 5: no such field, or it doesn't take that value.
 import base64
 import io
 import json
@@ -360,6 +364,56 @@ def apply(src, edits, dst):
     doc.save(dst, garbage=3, deflate=True)
 
 
+def state_on(mupdf, pdf, xref):
+    """The name of the state a checkbox or a radio button takes when on: the one of its looks that isn't "Off"; None, it has none."""
+    looks = mupdf.pdf_dict_get(mupdf.pdf_dict_get(mupdf.pdf_new_indirect(pdf, xref, 0), mupdf.PDF_ENUM_NAME_AP), mupdf.PDF_ENUM_NAME_N)
+    names = [mupdf.pdf_to_name(mupdf.pdf_dict_get_key(looks, i)) for i in range(mupdf.pdf_dict_len(looks))] if mupdf.pdf_is_dict(looks) and not mupdf.pdf_is_stream(looks) else []
+    return next((n for n in names if n != "Off"), None)
+
+
+def fill(doc, marks):
+    """The form's fields with their values: each widget's look made again by MuPDF, a box's or a button's state chosen among its own."""
+    if not marks:
+        return
+    mupdf = pymupdf.mupdf
+    pdf = mupdf.pdf_document_from_fz_document(doc)
+    # (its number, its field's name, its type, its flags, its options, its longest text, its state when on), by widget.
+    widgets = [(w.xref, w.field_name, w.field_type, w.field_flags, w.choice_values, w.text_maxlen, state_on(mupdf, pdf, w.xref)) for page in doc for w in page.widgets()]
+    for m in marks:
+        of = next((w for w in widgets if w[0] == m["ref"]), None)
+        if not of:
+            sys.exit(5)
+        same = [w for w in widgets if w[0] == m["ref"] or (of[1] and w[1] == of[1] and w[2] == of[2])]
+        text, kind, flags = m["value"], of[2], of[3]
+        if kind in (pymupdf.PDF_WIDGET_TYPE_CHECKBOX, pymupdf.PDF_WIDGET_TYPE_RADIOBUTTON):
+            # Its other widgets go off, but those of the same state (a button drawn twice).
+            state = {w[0]: w[6] for w in same}
+            on = state[m["ref"]] if text == "On" else None
+            if text not in ("On", "Off") or (text == "On" and not on):
+                sys.exit(5)
+            for w in same:
+                obj = mupdf.pdf_new_indirect(pdf, w[0], 0)
+                mupdf.pdf_dict_put_name(obj, mupdf.PDF_ENUM_NAME_AS, on if on and w[6] == on else "Off")
+            continue
+        if kind not in (pymupdf.PDF_WIDGET_TYPE_TEXT, pymupdf.PDF_WIDGET_TYPE_COMBOBOX, pymupdf.PDF_WIDGET_TYPE_LISTBOX):
+            sys.exit(5)
+        if not draws(pymupdf.Font("helv"), text):
+            sys.exit(3)
+        if kind == pymupdf.PDF_WIDGET_TYPE_TEXT:
+            text = text[: of[5]] if of[5] else text
+        else:
+            options = [o[1] if isinstance(o, (list, tuple)) else o for o in of[4] or []]
+            if text and text not in options and not flags & pymupdf.PDF_CH_FIELD_IS_EDIT:
+                sys.exit(5)
+        for w in same:
+            obj = mupdf.pdf_new_indirect(pdf, w[0], 0)
+            if kind == pymupdf.PDF_WIDGET_TYPE_LISTBOX:
+                # MuPDF draws a list without its choice: as a menu closed on it.
+                mupdf.pdf_dict_put_int(obj, mupdf.PDF_ENUM_NAME_Ff, flags | pymupdf.PDF_CH_FIELD_IS_COMBO)
+            if not mupdf.pdf_set_field_value(pdf, obj, text, 1):
+                sys.exit(5)
+
+
 def stamp(src, marks, dst):
     doc = load(src)
     if doc.needs_pass:
@@ -369,6 +423,8 @@ def stamp(src, marks, dst):
     helv = pymupdf.Font("helv")
     if any(m["kind"] == "text" and not draws(helv, m["text"]) for m in marks):
         sys.exit(3)
+    fill(doc, [m for m in marks if m["kind"] == "field"])
+    marks = [m for m in marks if m["kind"] != "field"]
     doc.bake()
     doc.xref_set_key(doc.pdf_catalog(), "AcroForm", "null")
     for n in sorted({m["page"] for m in marks}):
@@ -381,6 +437,12 @@ def stamp(src, marks, dst):
                 continue
             if m["kind"] == "image":
                 layer.insert_image(pymupdf.Rect(m["x"], m["y"], m["x"] + m["w"], m["y"] + m["h"]), stream=base64.b64decode(m["image"]), keep_proportion=False)
+            elif m["kind"] == "path":
+                shape = layer.new_shape()
+                for stroke in m["path"]:
+                    shape.draw_polyline([(m["x"] + x * m["w"], m["y"] + y * m["h"]) for x, y in [*stroke, stroke[-1]]])
+                shape.finish(width=m["size"], color=(0, 0, 0), lineCap=1, lineJoin=1, closePath=False)
+                shape.commit()
             else:
                 write(layer, helv, m["x"], m["y"] + m["size"] * 0.8, m["text"], m["size"], (0, 0, 0))
         sheet.subset_fonts()
